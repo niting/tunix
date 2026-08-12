@@ -19,12 +19,14 @@ from huggingface_hub import snapshot_download
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.experimental import mesh_utils
 from kubernetes import client, config as k8s_config
 import numpy as np
 import optax
 from orbax import checkpoint as ocp
 import qwix
 from transformers import AutoTokenizer
+from pydantic import ValidationError
 from tunix.cli.utils import data as data_lib
 from tunix.rl.agentic.agents import agent_types
 from tunix.utils import compat
@@ -33,28 +35,40 @@ import vllm  # pytype: disable=import-error
 faulthandler.register(signal.SIGINT, all_threads=True)
 
 Dataset = datasets_lib.Dataset
+def str2bool(v):
+  if isinstance(v, bool):
+    return v
+  if v.lower() in ("yes", "true", "t", "y", "1"):
+    return True
+  elif v.lower() in ("no", "false", "f", "n", "0"):
+    return False
+  else:
+    raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
 # ==========================================
 # 0. Argument Parsing
 # ==========================================
 parser = argparse.ArgumentParser(
     description="DeepSWE Training with Multi-turn Agentic Framework"
 )
+parser.add_argument("--scan_layers", type=str2bool, default=False)
 
 # General Config
 parser.add_argument("--models_base_dir", type=str, default="models")
 parser.add_argument(
     "--model_source",
     type=str,
-    default="huggingface",
+    default="maxtext",
     choices=["huggingface", "maxtext"],
 )
 parser.add_argument(
     "--model_absolute_path",
     type=str,
-    default=None,
+    default="gs://maxtext-model-checkpoints/qwen3.5-35b-a3b/scanned/0/items",
 )
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--model_version", type=str, default="Qwen/Qwen3-32B")
+parser.add_argument("--model_version", type=str, default="Qwen3.5-35B-A3B")
 parser.add_argument("--node_selector_val", type=str, default="deepswe-cpu-pool")
 parser.add_argument("--dataset_path", type=str, default=None)
 
@@ -133,6 +147,10 @@ parser.add_argument(
 parser.add_argument("--ckpt_dir", type=str, default="/tmp/cp/deepswe_ckpt/01")
 parser.add_argument("--max_to_keep", type=int, default=4)
 parser.add_argument("--save_interval_steps", type=int, default=500)
+parser.add_argument("--checkpoint_storage_concurrent_gb", type=int, default=96)
+parser.add_argument("--checkpoint_storage_use_ocdbt", type=str2bool, default=True)
+parser.add_argument("--checkpoint_storage_use_zarr3", type=str2bool, default=True)
+
 
 # Microbatch Sizes
 parser.add_argument("--train_micro_batch_size", type=int, default=1)
@@ -310,6 +328,22 @@ def patch_kubernetes_runtime():
     DockerRuntime._start_kubernetes_pod = patched_start_kubernetes_pod
     print(
         "[Monkeypatch] Successfully patched DockerRuntime._start_kubernetes_pod"
+    )
+
+    original_run = DockerRuntime.run
+
+    def patched_run(self, cmd, *args, **kwargs):
+      if isinstance(cmd, str) and cmd.startswith("chmod +x"):
+        path = cmd.split()[-1]
+        new_cmd = f"sh -c 'i=1; while [ $i -le 10 ]; do if [ -f {path} ]; then chmod +x {path} && exit 0; fi; sleep 0.5; i=$((i+1)); done; exit 1'"
+        print(f"[Monkeypatch] Intercepted chmod +x: replacing '{cmd}' with '{new_cmd}'")
+        return original_run(self, new_cmd, *args, **kwargs)
+      return original_run(self, cmd, *args, **kwargs)
+
+    DockerRuntime.run = patched_run
+    print(
+        "[Monkeypatch] Successfully patched DockerRuntime.run to handle chmod"
+        " +x race condition"
     )
   except Exception as e:
     print(f"[Monkeypatch] Failed to patch DockerRuntime: {e}")
@@ -565,7 +599,10 @@ USE_ROLLOUT_LOGPS = args.use_rollout_logps
 tokenizer_path = MODEL_PATH
 local_files_only = True
 if MODEL_SOURCE == "maxtext" and MODEL_PATH.startswith("gs://"):
-  tokenizer_path = MODEL_VERSION
+  if MODEL_VERSION.startswith("Qwen/"):
+    tokenizer_path = MODEL_VERSION
+  else:
+    tokenizer_path = f"Qwen/{MODEL_VERSION}"
   local_files_only = False
   print(f"Loading tokenizer from HF Hub: {tokenizer_path}")
 
@@ -741,10 +778,10 @@ rollout_shape = tuple(d for _, d in rollout_dims)
 train_axis_names = tuple(name for name, _ in train_dims)
 train_shape = tuple(d for _, d in train_dims)
 
-rollout_devices = np.array(devices[:num_rollout_devices]).reshape(rollout_shape)
-train_devices = np.array(
-    devices[num_rollout_devices : num_rollout_devices + num_train_devices]
-).reshape(train_shape)
+rollout_devices = mesh_utils.create_device_mesh(rollout_shape, devices[:num_rollout_devices], allow_split_physical_axes=True)
+train_devices = mesh_utils.create_device_mesh(
+    train_shape, devices[num_rollout_devices : num_rollout_devices + num_train_devices], allow_split_physical_axes=True
+)
 
 rollout_mesh = Mesh(rollout_devices, axis_names=rollout_axis_names)
 train_mesh = Mesh(train_devices, axis_names=train_axis_names)
@@ -773,12 +810,19 @@ if MODEL_SOURCE == "maxtext":
       model_path=MODEL_PATH,
       enable_checkpointing=True,
       allow_split_physical_axes=True,
-      scan_layers=False,
+      scan_layers=args.scan_layers,
+      checkpoint_storage_concurrent_gb=args.checkpoint_storage_concurrent_gb,
+      checkpoint_storage_use_ocdbt=args.checkpoint_storage_use_ocdbt,
+      checkpoint_storage_use_zarr3=args.checkpoint_storage_use_zarr3,
   )
 else:
   qwen_reference = params_lib.create_model_from_safe_tensors(
       MODEL_PATH, config, mesh=train_mesh, dtype=PARAM_DTYPE
   )
+
+if hasattr(qwen_reference, "use_no_op_mappings"):
+  qwen_reference.use_no_op_mappings = True
+  logging.info("Forced use_no_op_mappings=True on reference model.")
 
 
 def get_lora_model(base_model, model_mesh):
@@ -813,6 +857,10 @@ else:
       graph_def,
       jax.tree.map(jnp.copy, params),
   )
+
+if hasattr(qwen_actor, "use_no_op_mappings"):
+  qwen_actor.use_no_op_mappings = True
+  logging.info("Forced use_no_op_mappings=True on actor model.")
 
 sft_utils.show_hbm_usage()
 
@@ -891,6 +939,10 @@ vllm_rollout_dict = {
         "enable_prefix_caching": True,
         "tokenizer": tokenizer_path,
     },
+    "rollout_vllm_sampling_kwargs": {
+        "stop": ["</function>"],
+        "detokenize": True,
+    },
 }
 
 if MODEL_SOURCE == "maxtext":
@@ -909,12 +961,7 @@ if MODEL_SOURCE == "maxtext":
           "attention": "vllm_rpa",
       }
   }
-  # Force no-op mappings for weight sync if both trainer and sampler use MaxText
-  if hasattr(qwen_reference, "use_no_op_mappings"):
-    qwen_reference.use_no_op_mappings = True  # pyrefly: ignore[missing-attribute]
-  if hasattr(qwen_actor, "use_no_op_mappings"):
-    qwen_actor.use_no_op_mappings = True  # pyrefly: ignore[missing-attribute]
-    logging.info("Forced use_no_op_mappings=True on actor/reference models.")
+
 
 
 if ROLLOUT_ENGINE == "sglang_jax":
@@ -999,12 +1046,18 @@ cluster_config = rl_engine_lib.ClusterConfig(
 )
 sft_utils.show_hbm_usage()
 
-rl_engine = rl_engine_lib.RLEngine(
-    actor=qwen_actor,
-    reference=qwen_reference,
-    tokenizer=tokenizer,
-    cluster_config=cluster_config,
-)
+try:
+  rl_engine = rl_engine_lib.RLEngine(
+      actor=qwen_actor,
+      reference=qwen_reference,
+      tokenizer=tokenizer,
+      cluster_config=cluster_config,
+  )
+except ValidationError as e:
+  print("Failed to initialize RLEngine due to ValidationError:", flush=True)
+  import pprint
+  pprint.pprint(e.errors())
+  raise
 
 # %%
 # ==========================================
@@ -1042,6 +1095,7 @@ agentic_grpo_learner = agentic_grpo_learner.GRPOLearner(
         "max_steps": MAX_TURNS,
         "step_timeout": STEP_TIMEOUT_SECS,
         "reward_timeout": REWARD_TIMEOUT_SECS,
+        "verbose": True,
     },
     algo_config=grpo_config,
     chat_parser=chat_parser,
