@@ -18,6 +18,51 @@ import logging
 import os
 
 
+def patch_agent_sandbox_resources():
+  """Strip resource requests from agent_sandbox_rl templates to prevent Kueue throttling on GKE."""
+  for path in [
+      "/opt/venv/lib/python3.12/site-packages/agent_sandbox_rl/resources.py",
+  ]:
+    if os.path.exists(path):
+      try:
+        with open(path) as f:
+          content = f.read()
+        target = (
+            '"resources": {"requests": {\n'
+            '                "cpu": template.resources.cpu,\n'
+            '                "memory": template.resources.memory,\n'
+            '            }},'
+        )
+        if target in content:
+          with open(path, "w") as f:
+            f.write(content.replace(target, '"resources": {},'))
+          logging.info("[Monkeypatch] Patched agent_sandbox_rl resources in %s", path)
+      except Exception as e:
+        logging.warning("[Monkeypatch] Could not patch %s: %s", path, e)
+
+
+def patch_kubernetes_api_client():
+  """Ensure kubernetes.client.api_client handles non-bytes exception bodies cleanly on Python 3.12."""
+  for path in [
+      "/opt/venv/lib/python3.12/site-packages/kubernetes/client/api_client.py",
+  ]:
+    if os.path.exists(path):
+      try:
+        with open(path) as f:
+          content = f.read()
+        target = "e.body = e.body.decode('utf-8') if six.PY3 else e.body"
+        replacement = (
+            "e.body = (e.body.decode('utf-8') if hasattr(e.body, 'decode') "
+            "else str(e.body)) if six.PY3 else e.body"
+        )
+        if target in content:
+          with open(path, "w") as f:
+            f.write(content.replace(target, replacement))
+          logging.info("[Monkeypatch] Patched kubernetes api_client in %s", path)
+      except Exception as e:
+        logging.warning("[Monkeypatch] Could not patch %s: %s", path, e)
+
+
 def patch_kubernetes_runtime():
   """Monkeypatch r2egym DockerRuntime to dynamically configure Kubernetes nodeSelector.
 
@@ -26,6 +71,8 @@ def patch_kubernetes_runtime():
   override it to match the nodepool configured via NODE_SELECTOR_KEY and
   NODE_SELECTOR_VAL environment variables.
   """
+  patch_agent_sandbox_resources()
+  patch_kubernetes_api_client()
   try:
     from r2egym.agenthub.runtime.docker import DockerRuntime
 
