@@ -98,8 +98,34 @@ RUN if [ "$INSTALL_RAIDEN" = "true" ]; then \
     fi; \
 fi
 
-# Force install numpy version to avoid version conflicts.
-RUN uv pip install numpy==2.3.5
+# Build argument to conditionally install DeepSWE evaluation dependencies
+ARG INSTALL_DEEPSWE_DEPS=false
+
+# Install DeepSWE specific dependencies and apply runtime patches conditionally
+RUN if [ "$INSTALL_DEEPSWE_DEPS" = "true" ]; then \
+      uv pip install kubernetes gym swebench==3.0.2 && \
+      uv pip install --no-deps git+https://github.com/kubernetes-sigs/agent-sandbox.git#subdirectory=clients/python/agentic-sandbox-client && \
+      uv pip install --no-deps git+https://github.com/kubernetes-sigs/agent-sandbox.git#subdirectory=examples/agent-sandbox-rl && \
+      uv pip install --no-deps git+https://github.com/r2e-gym/r2e-gym.git@0d94c4eb9431cd195c55a7ea3abd54006c9a1735 && \
+      sed -i 's/create_repo, upload_folder, HfFolder/create_repo, upload_folder/' /opt/venv/lib/python3.12/site-packages/r2egym/agenthub/utils/utils.py && \
+      sed -i 's/self.commit = ParsedCommit(\*\*json.loads(self.commit_json))/self.commit = ParsedCommit(\*\*(json.loads(self.commit_json) if isinstance(self.commit_json, str) else self.commit_json))/' /opt/venv/lib/python3.12/site-packages/r2egym/agenthub/runtime/docker.py && \
+      sed -i "s/e.body = e.body.decode('utf-8') if six.PY3 else e.body/e.body = (e.body.decode('utf-8') if hasattr(e.body, 'decode') else str(e.body)) if six.PY3 else e.body/" /opt/venv/lib/python3.12/site-packages/kubernetes/client/api_client.py && \
+      python3 -c "p='/opt/venv/lib/python3.12/site-packages/agent_sandbox_rl/resources.py'; c=open(p).read(); t='\"resources\": {\"requests\": {\n                \"cpu\": template.resources.cpu,\n                \"memory\": template.resources.memory,\n            }},'; open(p,'w').write(c.replace(t, '\"resources\": {},'))"; \
+    fi
+
+# Build argument to conditionally install Kubernetes tools
+ARG INSTALL_K8S_TOOLS=false
+
+# Install gcloud, kubectl, k9s
+RUN if [ "$INSTALL_K8S_TOOLS" = "true" ]; then \
+      apt-get update && \
+      apt-get install -y vim lsof procps apt-transport-https ca-certificates gnupg && \
+      (echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list) && \
+      (curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --batch --yes --no-tty --dearmor -o /usr/share/keyrings/cloud.google.gpg) && \
+      apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin kubectl && \
+      (curl -sS https://webinstall.dev/k9s | bash) && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Copy the rest of the project files
 COPY . .
