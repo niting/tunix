@@ -278,6 +278,12 @@ parser.add_argument(
 parser.add_argument(
     "--loss_agg_mode", type=str, default="sequence-mean-token-scale"
 )
+parser.add_argument(
+    "--sampler_is",
+    type=str,
+    default=None,
+    help="Truncated importance sampling mode for GRPO (e.g. 'token' or None)",
+)
 parser.add_argument("--advantage_estimator", type=str, default="rloo")
 parser.add_argument(
     "--use_rollout_logps",
@@ -1175,6 +1181,7 @@ config_kwargs = {
     "loss_agg_mode": LOSS_AGG_MODE,
     "advantage_estimator": ADVANTAGE_ESTIMATOR,
     "use_rollout_logps": USE_ROLLOUT_LOGPS,
+    "sampler_is": args.sampler_is,
 }
 
 grpo_config = agentic_grpo_learner.GRPOConfig(**config_kwargs)
