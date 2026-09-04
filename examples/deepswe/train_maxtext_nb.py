@@ -854,6 +854,7 @@ trainer_config = pyconfig.initialize(
         "load_checkpoint_only_once=True",
         "use_standalone_converter=False",
         "log_config=False",
+        "allow_split_physical_axes=True",
     ],
     vllm_hf_overrides={"architectures": ["MaxTextForCausalLM"]},
 )
@@ -876,6 +877,7 @@ sampler_config = pyconfig.initialize(
         "remat_policy=none",
         "use_standalone_converter=False",
         "log_config=False",
+        "allow_split_physical_axes=True",
     ],
     config_class=types.RLConfig,
     vllm_hf_overrides={"architectures": ["MaxTextForCausalLM"]},
