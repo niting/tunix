@@ -274,16 +274,11 @@ class PrewarmDatasetIterator:
         logging.warning("[PrewarmDatasetIterator] Warm note: %s", e)
 
   def _unwarm_batch(self, images: list[str]):
-    if images and self.fleet:
-      for img in images:
-        try:
-          self.fleet.unwarm_image(img)
-          logging.info(
-              "[PrewarmDatasetIterator] Unwarmed finished pool on K8s: %s",
-              img,
-          )
-        except Exception as e:
-          logging.warning("[PrewarmDatasetIterator] Unwarm note: %s", e)
+    # No-op: Do not aggressively unwarm pools during training because Tunix's
+    # AgenticRLLearner prefetches batches into an asynchronous prompt_queue.
+    # Unwarming here causes a race condition where active/queued tasks have
+    # their warmpools destroyed before rollout workers claim them.
+    pass
 
   def __iter__(self):
     return self
