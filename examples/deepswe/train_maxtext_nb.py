@@ -54,6 +54,14 @@ import vllm  # pytype: disable=import-error
 maxtext_vllm_adapter.register()
 logging.info("Successfully registered MaxTextForCausalLM model with vLLM.")
 
+# Disable MRoPE in vLLM to prevent slow 3D position ID generation for text-only sampling
+try:
+  from vllm.config import ModelConfig
+  ModelConfig.uses_mrope = property(lambda self: False)
+  logging.info("Successfully patched vLLM ModelConfig.uses_mrope to False for sampling.")
+except Exception as e:
+  logging.warning("Could not patch vLLM ModelConfig.uses_mrope: %s", e)
+
 faulthandler.register(signal.SIGINT, all_threads=True)
 
 Dataset = datasets_lib.Dataset
@@ -879,6 +887,7 @@ sampler_config = pyconfig.initialize(
         f"max_prefill_predict_length={MAX_PROMPT_LENGTH}",
         f"dtype={args.dtype}",
         "attention=vllm_rpa",
+        "use_mrope=False",
         "skip_jax_distributed_system=True",
         "remat_policy=none",
         "use_standalone_converter=False",
