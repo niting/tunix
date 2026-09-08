@@ -1055,7 +1055,7 @@ def _unstack_scanned_param(
   return (src_val,)
 
 
-_MOE_MLP_WEIGHTS = frozenset({'wi', 'wi_0', 'wi_1'})
+_MOE_MLP_WEIGHTS = frozenset({'wi', 'wi_0', 'wi_1', 'wo'})
 
 
 def _partition_size(
@@ -1197,6 +1197,30 @@ def _align_per_axis(
     else:
       pad_specs = [(axis, 1, t - s) for axis, s, t in mismatches]
     return _jit_zero_pad_axes(arr, tuple(pad_specs))
+
+  last_key = key_path.split('.')[-1]
+  is_kv = (
+      last_key in ('k_proj', 'v_proj', 'key', 'value')
+      or ('attn' in key_path and last_key in ('k', 'v'))
+      or ('attention' in key_path and any(k in last_key for k in ('key', 'value', 'k', 'v')))
+  )
+  # When replicating KV heads along a mismatched projection axis (e.g. tp > num_kv_heads),
+  # standard flat jnp.repeat duplicates adjacent scalar elements instead of whole heads.
+  # Reshape to (..., num_heads, head_dim), repeat along the heads axis, and reshape back.
+  if is_kv and len(mismatches) == 1:
+    axis, s, t = mismatches[0]
+    if t % s == 0:
+      rep = t // s
+      # Typical head_dim is 256 or 128 (Qwen 3.5 uses head_dim=256)
+      head_dim = 256 if s % 256 == 0 else (128 if s % 128 == 0 else s)
+      if head_dim < s:
+        num_heads = s // head_dim
+        new_shape = list(arr.shape)
+        new_shape[axis] = num_heads
+        new_shape.insert(axis + 1, head_dim)
+        arr_heads = arr.reshape(new_shape)
+        arr_repeated = jnp.repeat(arr_heads, rep, axis=axis)
+        return arr_repeated.reshape(tgt_shape)
 
   repeats = []
   for axis, s, t in mismatches:
