@@ -2114,6 +2114,83 @@ class UtilsTest(parameterized.TestCase):
     expected = jnp.pad(src, ((0, 1), (0, 0), (0, 2)))
     np.testing.assert_array_equal(np.asarray(result), expected)
 
+  def test_align_per_axis_moe_wo_zero_pad(self):
+    """MoE `wo` down-projection axis is zero-padded instead of repeated."""
+    src = jnp.ones((2, 1408, 16), dtype=jnp.float32)
+    tgt_shape = (2, 1536, 16)
+    result = utils._align_per_axis(
+        src, tgt_shape, tgt_sharding=None, key_path="decoder.layers_0.moe_block.wo"
+    )
+    self.assertEqual(result.shape, tgt_shape)
+    expected = jnp.pad(src, ((0, 0), (0, 128), (0, 0)))
+    np.testing.assert_array_equal(np.asarray(result), expected)
+
+  def test_align_per_axis_kv_replication_head_dim_128(self):
+    """2D KV projection with head_dim=128 replicates individual heads."""
+    # 4 heads of dim 128 (total dim=512), embed_dim=4
+    h0 = jnp.full((128, 4), 1.0, dtype=jnp.float32)
+    h1 = jnp.full((128, 4), 2.0, dtype=jnp.float32)
+    h2 = jnp.full((128, 4), 3.0, dtype=jnp.float32)
+    h3 = jnp.full((128, 4), 4.0, dtype=jnp.float32)
+    src = jnp.concatenate([h0, h1, h2, h3], axis=0)  # (512, 4)
+
+    tgt_shape = (1024, 4)  # 2x replication -> 8 heads
+    result = utils._align_per_axis(
+        src,
+        tgt_shape,
+        tgt_sharding=None,
+        key_path="model.layers.0.self_attn.k_proj.weight",
+        head_dim=128,
+    )
+    self.assertEqual(result.shape, tgt_shape)
+    expected = jnp.concatenate(
+        [h0, h0, h1, h1, h2, h2, h3, h3], axis=0
+    )
+    np.testing.assert_array_equal(np.asarray(result), expected)
+
+  def test_align_per_axis_kv_replication_head_dim_256(self):
+    """2D KV projection with head_dim=256 replicates individual heads."""
+    # 2 heads of dim 256 (total dim=512), embed_dim=4
+    h0 = jnp.full((256, 4), 1.0, dtype=jnp.float32)
+    h1 = jnp.full((256, 4), 2.0, dtype=jnp.float32)
+    src = jnp.concatenate([h0, h1], axis=0)  # (512, 4)
+
+    tgt_shape = (1024, 4)  # 2x replication -> 4 heads
+    result = utils._align_per_axis(
+        src,
+        tgt_shape,
+        tgt_sharding=None,
+        key_path="decoder.layers_0.self_attention.key.kernel",
+        head_dim=256,
+    )
+    self.assertEqual(result.shape, tgt_shape)
+    expected = jnp.concatenate([h0, h0, h1, h1], axis=0)
+    np.testing.assert_array_equal(np.asarray(result), expected)
+
+  def test_align_per_axis_query_proj_not_treated_as_kv(self):
+    """Query projection is not treated as KV projection."""
+    self.assertFalse(
+        utils._is_kv_projection("decoder.layers_0.self_attention.query.kernel")
+    )
+    self.assertFalse(
+        utils._is_kv_projection("model.layers.0.self_attn.q_proj.weight")
+    )
+    self.assertFalse(
+        utils._is_kv_projection("decoder.layers_0.self_attention.out.kernel")
+    )
+    self.assertTrue(
+        utils._is_kv_projection("decoder.layers_0.self_attention.key.kernel")
+    )
+    self.assertTrue(
+        utils._is_kv_projection("decoder.layers_0.self_attention.value.kernel")
+    )
+    self.assertTrue(
+        utils._is_kv_projection("model.layers.0.self_attn.k_proj.weight")
+    )
+    self.assertTrue(
+        utils._is_kv_projection("model.layers.0.self_attn.v_proj.weight")
+    )
+
 
 
   def test_unroll_scanned_layers_dict_state(self):

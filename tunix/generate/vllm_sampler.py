@@ -227,12 +227,26 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
             "from 'additional_config'."
         )
 
+      head_dim = None
+      if self._model_runner and hasattr(self._model_runner, "model_config"):
+        head_dim = getattr(
+            self._model_runner.model_config, "get_head_size", lambda: None
+        )()
+      elif "maxtext_config" in additional_config:
+        m_cfg = additional_config["maxtext_config"]
+        head_dim = (
+            getattr(m_cfg, "head_dim", None)
+            if not isinstance(m_cfg, dict)
+            else m_cfg.get("head_dim")
+        )
+
       utils.transfer_state_directly(
           src_state=updated_weights,
           dst_state=self.transformer_state,
           reshard_fn=reshard.reshard_pytree,
           delete_dst_buffers=True,  # Ensure old weights are deleted to free up HBM memory
           reshard_chunk_size=self.config.reshard_chunk_size,
+          head_dim=head_dim,
       )
 
     if hasattr(self._model_runner, "state_leaves"):

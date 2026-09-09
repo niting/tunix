@@ -1055,7 +1055,7 @@ def _unstack_scanned_param(
   return (src_val,)
 
 
-_MOE_MLP_WEIGHTS = frozenset({'wi', 'wi_0', 'wi_1'})
+_MOE_MLP_WEIGHTS = frozenset({'wi', 'wi_0', 'wi_1', 'wo'})
 
 
 def _partition_size(
@@ -1132,11 +1132,48 @@ def _jit_repeat_axes(arr, repeats):
   return out
 
 
+@functools.partial(jax.jit, static_argnames=('axis', 'rep', 'head_dim'))
+def _jit_repeat_kv_heads(arr, axis: int, rep: int, head_dim: int):
+  """Reshapes (..., num_heads * head_dim, ...) to expose heads, repeats, and flattens."""
+  src_dim = arr.shape[axis]
+  num_heads = src_dim // head_dim
+  new_shape = list(arr.shape)
+  new_shape[axis] = num_heads
+  new_shape.insert(axis + 1, head_dim)
+  arr_heads = arr.reshape(new_shape)
+  arr_repeated = jnp.repeat(arr_heads, rep, axis=axis)
+  final_shape = list(arr.shape)
+  final_shape[axis] = src_dim * rep
+  return arr_repeated.reshape(final_shape)
+
+
+def _is_moe_weight(key_path: str) -> bool:
+  """Returns whether key_path points to an MoE MLP weight."""
+  parts = key_path.split('.')
+  leaf = parts[-1]
+  target = parts[-2] if len(parts) >= 2 and leaf in ('kernel', 'weight') else leaf
+  return target in _MOE_MLP_WEIGHTS
+
+
+def _is_kv_projection(key_path: str) -> bool:
+  """Returns whether key_path points to an attention Key or Value projection."""
+  parts = key_path.split('.')
+  leaf = parts[-1]
+  target = parts[-2] if len(parts) >= 2 and leaf in ('kernel', 'weight', 'bias', 'scale') else leaf
+  target_lower = target.lower()
+  if target_lower in ('k_proj', 'v_proj', 'key', 'value', 'k', 'v', 'kv_weight'):
+    return True
+  if ('attn' in key_path or 'attention' in key_path) and target_lower in ('k', 'v', 'key', 'value'):
+    return True
+  return False
+
+
 def _align_per_axis(
     arr: jax.Array | np.ndarray,
     tgt_shape: Tuple[int, ...],
     tgt_sharding: Optional[jax.sharding.Sharding],
     key_path: str,
+    head_dim: Optional[int] = None,
 ) -> jax.Array | np.ndarray:
   """Aligns `arr` to `tgt_shape` via either pure-repeat or pure-zero_pad.
 
@@ -1173,8 +1210,7 @@ def _align_per_axis(
   if not mismatches:
     return arr
 
-  last_key = key_path.split('.')[-1]
-  if last_key in _MOE_MLP_WEIGHTS:
+  if _is_moe_weight(key_path):
     if isinstance(tgt_sharding, jax.sharding.NamedSharding):
       mesh = tgt_sharding.mesh
       pad_specs = []
@@ -1197,6 +1233,20 @@ def _align_per_axis(
     else:
       pad_specs = [(axis, 1, t - s) for axis, s, t in mismatches]
     return _jit_zero_pad_axes(arr, tuple(pad_specs))
+
+  # When replicating KV heads along a mismatched projection axis (e.g. tp > num_kv_heads):
+  # 1. If tensor is already >=3D and axis is num_heads (e.g. (..., num_heads, head_dim)),
+  #    flat repeat along axis cleanly preserves head geometry.
+  # 2. If tensor is 2D with flattened (num_heads * head_dim) and head_dim is provided,
+  #    reshape to expose heads before repeating, avoiding element-level corruption.
+  if _is_kv_projection(key_path) and len(mismatches) == 1:
+    axis, s, t = mismatches[0]
+    if t % s == 0:
+      rep = t // s
+      if axis + 1 < arr.ndim and (head_dim is None or arr.shape[axis + 1] == head_dim):
+        return _jit_repeat_axes(arr, ((axis, rep),))
+      if head_dim is not None and s % head_dim == 0 and head_dim < s:
+        return _jit_repeat_kv_heads(arr, axis=axis, rep=rep, head_dim=head_dim)
 
   repeats = []
   for axis, s, t in mismatches:
@@ -1253,6 +1303,7 @@ def _align_to_model_shape(
     src_val: jax.Array | np.ndarray,
     tgt_val: jax.Array | np.ndarray,
     key_path: str,
+    head_dim: Optional[int] = None,
 ) -> jax.Array | np.ndarray:
   """Aligns src_val to tgt_val's shape via per-axis repeat / zero-pad.
 
@@ -1266,7 +1317,9 @@ def _align_to_model_shape(
     return src_val
 
   tgt_sharding = getattr(tgt_val, 'sharding', None)
-  return _align_per_axis(src_val, tgt_val.shape, tgt_sharding, key_path)
+  return _align_per_axis(
+      src_val, tgt_val.shape, tgt_sharding, key_path, head_dim=head_dim
+  )
 
 
 def _bulk_align_and_unstack(
@@ -1274,6 +1327,7 @@ def _bulk_align_and_unstack(
     scan_axis: int,
     per_layer_tgt_val: jax.Array | np.ndarray,
     key_path: str,
+    head_dim: Optional[int] = None,
 ) -> Tuple[jax.Array | np.ndarray, ...]:
   """Applies per-axis alignment on a scanned tensor, then unstacks.
 
@@ -1293,6 +1347,7 @@ def _bulk_align_and_unstack(
     per_layer_tgt_val: A target leaf — its `.shape`, `.sharding`, and dtype
       drive the alignment policy.
     key_path: Dot-separated source path for diagnostics.
+    head_dim: Optional attention head dimension for KV-head replication.
 
   Returns:
     A tuple of `num_layers` per-layer arrays at the per-layer target shape.
@@ -1311,7 +1366,7 @@ def _bulk_align_and_unstack(
     return tuple(jnp.unstack(arr, axis=scan_axis))
 
   aligned = _align_per_axis(
-      arr, scanned_tgt_shape, scanned_tgt_sharding, key_path
+      arr, scanned_tgt_shape, scanned_tgt_sharding, key_path, head_dim=head_dim
   )
   return tuple(jnp.unstack(aligned, axis=scan_axis))
 
@@ -1585,6 +1640,7 @@ def transfer_state_directly(
     scan_axis: int = 1,
     delete_dst_buffers: bool = False,
     reshard_chunk_size: Optional[int] = None,
+    head_dim: Optional[int] = None,
 ) -> None:
   """Transfers state directly by matching structure, stripping wrappers.
 
@@ -1612,6 +1668,7 @@ def transfer_state_directly(
       start with roughly `10 * num_layers` for a dense transformer and tune
       downward if you still see fragmentation. When None (default) the
       original single-call reshard behavior is preserved.
+    head_dim: Optional attention head dimension for KV-head replication.
   """
   def safe_has_key(obj: Mapping[str, Any], key: str) -> bool:
     if isinstance(obj, dict):
@@ -1685,7 +1742,7 @@ def transfer_state_directly(
       if key_tuple in src_flat:
         src_val = src_flat[key_tuple]
         src_val = _apply_dtype_cast(src_val, tgt_val.dtype, path_str)
-        src_val = _align_to_model_shape(src_val, tgt_val, path_str)
+        src_val = _align_to_model_shape(src_val, tgt_val, path_str, head_dim=head_dim)
         filtered_src_flat[key_tuple] = src_val
         filtered_tgt_flat[key_tuple] = tgt_val
         continue
@@ -1750,12 +1807,12 @@ def transfer_state_directly(
                   candidate_path, src_val.shape, tgt_val.shape,
               )
               unstacked_cache[cache_key] = _bulk_align_and_unstack(
-                  src_val, scan_axis, tgt_val, candidate_path
+                  src_val, scan_axis, tgt_val, candidate_path, head_dim=head_dim
               )
 
           # Extract the layer_idx-th element from the unstacked cache.
           sliced_val = unstacked_cache[cache_key][layer_idx]
-          sliced_val = _align_to_model_shape(sliced_val, tgt_val, path_str)
+          sliced_val = _align_to_model_shape(sliced_val, tgt_val, path_str, head_dim=head_dim)
           filtered_src_flat[key_tuple] = sliced_val
           filtered_tgt_flat[key_tuple] = tgt_val
           continue
@@ -1802,7 +1859,7 @@ def transfer_state_directly(
               del wi_0_full, wi_1_full
 
             sliced_val = unstacked_cache[fused_scanned_key][layer_idx]
-            sliced_val = _align_to_model_shape(sliced_val, tgt_val, path_str)
+            sliced_val = _align_to_model_shape(sliced_val, tgt_val, path_str, head_dim=head_dim)
 
             filtered_src_flat[key_tuple] = sliced_val
             filtered_tgt_flat[key_tuple] = tgt_val
