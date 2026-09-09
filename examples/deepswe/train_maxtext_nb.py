@@ -137,10 +137,15 @@ parser.add_argument("--train_with_lora", type=str2bool, default=False)
 # GRPO Config
 parser.add_argument("--num_generations", type=int, default=8)
 parser.add_argument("--num_iterations", type=int, default=1)
-parser.add_argument("--beta", type=float, default=0.0)
-parser.add_argument("--epsilon", type=float, default=0.2)
+parser.add_argument("--beta", "--grpo_beta", dest="beta", type=float, default=0.0)
+parser.add_argument("--epsilon", "--grpo_epsilon", dest="epsilon", type=float, default=0.2)
 parser.add_argument("--epsilon_high", type=float, default=0.28)
 parser.add_argument("--off_policy_steps", type=int, default=0)
+parser.add_argument("--overlong_loss_masking", type=str2bool, default=False)
+parser.add_argument("--seq_logprob_error_threshold", type=float, default=None)
+parser.add_argument("--truncated_importance_sampling_type", type=str, default=None)
+parser.add_argument("--truncated_importance_sampling_ratio_min", type=float, default=None)
+parser.add_argument("--truncated_importance_sampling_ratio", type=float, default=None)
 parser.add_argument(
     "--force_on_policy_ratio",
     type=str2bool,
@@ -154,9 +159,9 @@ parser.add_argument(
 # Rollout Config
 parser.add_argument("--max_prompt_length", type=int, default=4096)
 parser.add_argument("--max_response_length", type=int, default=8192)
-parser.add_argument("--temperature", type=float, default=1.0)
-parser.add_argument("--top_p", type=float, default=None)
-parser.add_argument("--top_k", type=int, default=None)
+parser.add_argument("--temperature", "--decode_sampling_temperature", dest="temperature", type=float, default=1.0)
+parser.add_argument("--top_p", "--decode_sampling_nucleus_p", dest="top_p", type=float, default=None)
+parser.add_argument("--top_k", "--decode_sampling_top_k", dest="top_k", type=int, default=None)
 parser.add_argument("--rollout_engine", type=str, default="vllm")
 parser.add_argument("--vllm_utilization", type=float, default=0.4)
 parser.add_argument(
@@ -174,10 +179,14 @@ parser.add_argument(
 
 # Optimizer Config
 parser.add_argument("--learning_rate", type=float, default=1e-6)
-parser.add_argument("--b1", type=float, default=0.9)
-parser.add_argument("--b2", type=float, default=0.99)
-parser.add_argument("--weight_decay", type=float, default=0.01)
+parser.add_argument("--b1", "--adam_b1", dest="b1", type=float, default=0.9)
+parser.add_argument("--b2", "--adam_b2", dest="b2", type=float, default=0.99)
+parser.add_argument("--weight_decay", "--adam_weight_decay", dest="weight_decay", type=float, default=0.01)
 parser.add_argument("--max_grad_norm", type=float, default=1)
+parser.add_argument("--warmup_steps_fraction", type=float, default=0.0)
+parser.add_argument("--learning_rate_final_fraction", type=float, default=1.0)
+parser.add_argument("--float32_gate_logits", type=str2bool, default=False)
+parser.add_argument("--trainable_parameters_mask", type=str, default=None)
 parser.add_argument(
     "--optimizer_offload",
     type=bool,
@@ -304,7 +313,7 @@ parser.add_argument(
 parser.add_argument("--advantage_estimator", type=str, default="rloo")
 parser.add_argument(
     "--use_rollout_logps",
-    type=bool,
+    type=str2bool,
     default=False,
     help=(
         "Whether to use rollout-cached logprobs as old policy logps. "
@@ -907,6 +916,12 @@ trainer_config = pyconfig.initialize(
         f"checkpoint_storage_use_ocdbt={args.checkpoint_storage_use_ocdbt}",
         f"checkpoint_storage_use_zarr3={args.checkpoint_storage_use_zarr3}",
         f"checkpoint_storage_concurrent_gb={args.checkpoint_storage_concurrent_gb}",
+        f"float32_gate_logits={args.float32_gate_logits}",
+        *(
+            [f"trainable_parameters_mask={args.trainable_parameters_mask}"]
+            if args.trainable_parameters_mask
+            else []
+        ),
         "skip_jax_distributed_system=True",
         "load_checkpoint_only_once=True",
         "use_standalone_converter=False",
@@ -1057,19 +1072,38 @@ metrics_logging_options = metrics_logger.MetricsLoggerOptions(
     log_dir=args.metric_logger_dir, flush_every_n_steps=2
 )
 
-optimizer = optax.schedules.inject_hyperparams(optax.adamw)(
-    learning_rate=LEARNING_RATE,
+warmup_steps = int(MAX_STEPS * args.warmup_steps_fraction)
+if warmup_steps > 0 or args.learning_rate_final_fraction < 1.0:
+  lr_schedule = optax.warmup_cosine_decay_schedule(
+      init_value=0.0 if warmup_steps > 0 else LEARNING_RATE,
+      peak_value=LEARNING_RATE,
+      warmup_steps=warmup_steps,
+      decay_steps=MAX_STEPS,
+      end_value=LEARNING_RATE * args.learning_rate_final_fraction,
+  )
+else:
+  lr_schedule = LEARNING_RATE
+
+adamw_opt = optax.adamw(
+    learning_rate=lr_schedule,
     b1=B1,
     b2=B2,
     weight_decay=WEIGHT_DECAY,
     eps=1e-8,
 )
 
+from maxtext.optimizers import optimizers as maxtext_optimizers
+
+adamw_opt = maxtext_optimizers.apply_trainable_parameters_mask(
+    adamw_opt, trainer_config
+)
+
+transforms = []
 if MAX_GRAD_NORM is not None:
-  optimizer = optax.chain(
-      optax.clip_by_global_norm(MAX_GRAD_NORM),
-      optimizer,
-  )
+  transforms.append(optax.clip_by_global_norm(MAX_GRAD_NORM))
+transforms.append(adamw_opt)
+
+optimizer = optax.chain(*transforms)
 
 # %%
 # ==========================================
@@ -1084,6 +1118,7 @@ base_rollout_dict = {
     "top_p": TOP_P,
     "top_k": TOP_K,
     "kv_cache_size": KV_CACHE_SIZE,
+    "return_logprobs": USE_ROLLOUT_LOGPS,
 }
 
 vllm_rollout_dict = {
@@ -1236,6 +1271,11 @@ config_kwargs = {
     "use_rollout_logps": USE_ROLLOUT_LOGPS,
     "force_on_policy_ratio": FORCE_ON_POLICY_RATIO,
     "sampler_is": args.sampler_is,
+    "overlong_loss_masking": args.overlong_loss_masking,
+    "seq_logprob_error_threshold": args.seq_logprob_error_threshold,
+    "truncated_importance_sampling_type": args.truncated_importance_sampling_type,
+    "truncated_importance_sampling_ratio_min": args.truncated_importance_sampling_ratio_min,
+    "truncated_importance_sampling_ratio": args.truncated_importance_sampling_ratio,
 }
 
 grpo_config = agentic_grpo_learner.GRPOConfig(**config_kwargs)
