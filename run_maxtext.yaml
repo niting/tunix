@@ -181,6 +181,7 @@ spec:
                   --remat_policy decoder \
                   --docker_image_prefix europe-west4-docker.pkg.dev/cloud-tpu-multipod-dev/tunix \
                   --off_policy_steps 1 \
+                  --force_on_policy_ratio True \
                   --sampler_is token \
                   --loss_agg_mode token-mean \
                   --use_agent_sandbox) > >(tee -a /proc/1/fd/1 /tmp/combined.log) 2> >(tee -a /proc/1/fd/2 /tmp/combined.log >&2)') & PID=$!;
