@@ -141,6 +141,15 @@ parser.add_argument("--beta", type=float, default=0.0)
 parser.add_argument("--epsilon", type=float, default=0.2)
 parser.add_argument("--epsilon_high", type=float, default=0.28)
 parser.add_argument("--off_policy_steps", type=int, default=0)
+parser.add_argument(
+    "--force_on_policy_ratio",
+    type=str2bool,
+    default=False,
+    help=(
+        "Pin the surrogate ratio to 1.0 (old_logp := stop_gradient(current_logp)). "
+        "Valid for single-iteration on-policy training only."
+    ),
+)
 
 # Rollout Config
 parser.add_argument("--max_prompt_length", type=int, default=4096)
@@ -334,6 +343,20 @@ parser.add_argument(
 )
 
 
+# Profiler Config
+parser.add_argument(
+    "--enable_jax_profiler",
+    type=str2bool,
+    default=False,
+    help="Whether to start JAX profiler server for live/on-demand XProf collection.",
+)
+parser.add_argument(
+    "--jax_profiler_port",
+    type=int,
+    default=9999,
+    help="Port to start JAX profiler server on.",
+)
+
 # Other
 parser.add_argument("--do_mem_profiling", type=bool, default=False)
 
@@ -425,6 +448,23 @@ except ImportError as e:
 if pathwaysutils is not None and os.getenv("JAX_PLATFORMS", None) == "proxy":  # pyrefly: ignore[unbound-name]
   pathwaysutils.initialize()
 
+if args.enable_jax_profiler:
+  logging.info(
+      "Starting JAX profiler server on port %d...", args.jax_profiler_port
+  )
+  try:
+    jax.profiler.start_server(args.jax_profiler_port)
+    logging.info(
+        "JAX profiler server successfully started on port %d",
+        args.jax_profiler_port,
+    )
+  except Exception as e:
+    logging.warning(
+        "Failed to start JAX profiler server on port %d: %s",
+        args.jax_profiler_port,
+        e,
+    )
+
 
 # %%
 # ==========================================
@@ -511,6 +551,7 @@ BETA = args.beta
 EPSILON = args.epsilon
 EPSILON_HIGH = args.epsilon_high
 OFF_POLICY_STEPS = args.off_policy_steps
+FORCE_ON_POLICY_RATIO = args.force_on_policy_ratio
 
 # ====== Training ======
 DTYPE_MAP = {
@@ -829,7 +870,9 @@ if num_rollout_devices + num_train_devices > total_devices:
       f"train devices, but cluster only has {total_devices} available."
   )
 
-base_yml = os.path.join(os.path.dirname(pyconfig.__file__), "base.yml")
+base_yml = os.path.join(
+    os.path.dirname(pyconfig.__file__), "post_train", "rl.yml"
+)
 vllm_yml = os.path.join(
     os.path.dirname(pyconfig.__file__), "inference", "vllm.yml"
 )
@@ -870,6 +913,7 @@ trainer_config = pyconfig.initialize(
         "log_config=False",
         "allow_split_physical_axes=True",
     ],
+    config_class=types.RLConfig,
     vllm_hf_overrides={"architectures": ["MaxTextForCausalLM"]},
 )
 
@@ -1190,6 +1234,7 @@ config_kwargs = {
     "loss_agg_mode": LOSS_AGG_MODE,
     "advantage_estimator": ADVANTAGE_ESTIMATOR,
     "use_rollout_logps": USE_ROLLOUT_LOGPS,
+    "force_on_policy_ratio": FORCE_ON_POLICY_RATIO,
     "sampler_is": args.sampler_is,
 }
 
