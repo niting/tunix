@@ -63,6 +63,61 @@ def patch_kubernetes_api_client():
         logging.warning("[Monkeypatch] Could not patch %s: %s", path, e)
 
 
+def patch_k8s_watch_stream():
+  """Wrap K8sHelper._watch_claim to transparently retry on premature HTTP stream disconnections."""
+  try:
+    import http.client
+    from k8s_agent_sandbox.k8s_helper import K8sHelper
+    import urllib3.exceptions
+
+    orig_watch_claim = K8sHelper._watch_claim
+
+    def robust_watch_claim(
+        self,
+        claim_name: str,
+        namespace: str,
+        timeout: int,
+        require_ready: bool,
+        resource_version: str | None = None,
+    ) -> str:
+      import time
+      deadline = time.monotonic() + timeout
+      rv = resource_version or "0"
+      while True:
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+          raise TimeoutError(
+              f"Could not resolve claim '{claim_name}' within {timeout} seconds."
+          )
+        try:
+          return orig_watch_claim(
+              self,
+              claim_name,
+              namespace,
+              remaining,
+              require_ready,
+              resource_version=rv,
+          )
+        except (
+            urllib3.exceptions.HTTPError,
+            http.client.HTTPException,
+            ConnectionError,
+        ) as net_err:
+          logging.warning(
+              "[K8sWatchRetry] Watch on claim '%s' disconnected (%s: %s); retrying with rv=0",
+              claim_name,
+              type(net_err).__name__,
+              net_err,
+          )
+          rv = "0"
+          time.sleep(0.5)
+
+    K8sHelper._watch_claim = robust_watch_claim
+    logging.info("[Monkeypatch] Successfully wrapped K8sHelper._watch_claim with robust HTTP retry")
+  except Exception as e:
+    logging.warning("[Monkeypatch] Failed to patch K8sHelper._watch_claim: %s", e)
+
+
 def patch_kubernetes_runtime():
   """Monkeypatch r2egym DockerRuntime to dynamically configure Kubernetes nodeSelector.
 
@@ -73,6 +128,7 @@ def patch_kubernetes_runtime():
   """
   patch_agent_sandbox_resources()
   patch_kubernetes_api_client()
+  patch_k8s_watch_stream()
   try:
     from r2egym.agenthub.runtime.docker import DockerRuntime
 
