@@ -46,7 +46,7 @@ RUN uv pip install .
 # Install SFT/MaxText dependencies (unconditional)
 RUN uv pip install --upgrade flax && \
     uv pip install torchax aqtp tokamax math_verify drjax && \
-    uv pip install --no-deps git+https://github.com/google/maxtext.git
+    uv pip install --no-deps git+https://github.com/AI-Hypercomputer/maxtext.git@niting-rl_mlperf_temp
 
 # Build argument to conditionally install MaxText dependencies
 ARG INSTALL_MAXTEXT=false
