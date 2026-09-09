@@ -186,6 +186,7 @@ spec:
                   --warmup_steps_fraction 0.0 \
                   --learning_rate_final_fraction 1.0 \
                   --use_rollout_logps True \
+                  --force_on_policy_ratio True \
                   --overlong_loss_masking True \
                   --seq_logprob_error_threshold 2.0 \
                   --truncated_importance_sampling_type seq-mask-tis \
