@@ -176,6 +176,7 @@ parser.add_argument(
     default=8192,
     help="Max number of tokens to be processed in parallel by vLLM.",
 )
+parser.add_argument("--enable_prefix_caching", type=str2bool, default=False)
 
 # Optimizer Config
 parser.add_argument("--learning_rate", type=float, default=1e-6)
@@ -1136,7 +1137,7 @@ vllm_rollout_dict = {
     "rollout_vllm_kwargs": {
         "kv_cache_metrics": True,
         "disable_log_stats": False,
-        "enable_prefix_caching": False,
+        "enable_prefix_caching": args.enable_prefix_caching,
         "tokenizer": tokenizer_path,
         "dtype": "bfloat16",
         "enable_expert_parallel": False,
