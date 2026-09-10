@@ -463,7 +463,18 @@ if args.enable_jax_profiler:
       "Starting JAX profiler server on port %d...", args.jax_profiler_port
   )
   try:
-    jax.profiler.start_server(args.jax_profiler_port)
+    _orig_thread = threading.Thread
+
+    def _daemon_thread(*t_args, **t_kwargs):
+      t_kwargs["daemon"] = True
+      return _orig_thread(*t_args, **t_kwargs)
+
+    threading.Thread = _daemon_thread
+    try:
+      jax.profiler.start_server(args.jax_profiler_port)
+    finally:
+      threading.Thread = _orig_thread
+
     logging.info(
         "JAX profiler server successfully started on port %d",
         args.jax_profiler_port,

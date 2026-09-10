@@ -761,7 +761,10 @@ class PeftTrainer(abstract_trainer.AbstractTrainer):
     optimizer_state = nnx.state(self.optimizer, nnx.optimizer.OptState)
     optimizer_pspecs = nnx.get_partition_spec(optimizer_state)
     optimizer_sharded_state = jax.tree.map(
-        _shard, optimizer_state, optimizer_pspecs
+        _shard,
+        optimizer_state,
+        optimizer_pspecs,
+        is_leaf=lambda x: isinstance(x, optax.MaskedNode),
     )
     nnx.update(self.optimizer, optimizer_sharded_state)
 
