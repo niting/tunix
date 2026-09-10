@@ -195,7 +195,6 @@ spec:
                   --advantage_estimator grpo-loo \
                   --loss_agg_mode token-mean \
                   --float32_gate_logits True \
-                  --trainable_parameters_mask '"'"'["^(?!.*gate/(kernel|bias)).*"]'"'"' \
                   --checkpoint_storage_use_ocdbt True \
                   --checkpoint_storage_use_zarr3 False \
                   --logging_level INFO \
