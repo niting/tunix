@@ -43,7 +43,6 @@ spec:
                   topologyKey: kubernetes.io/hostname
             nodeSelector:
               cloud.google.com/gke-nodepool: cpu-np
-              kubernetes.io/hostname: gke-bodaborg-v5p-nap-cpu-np-456be230-clhl
             tolerations:
             - key: google.com/tpu
               operator: Exists
