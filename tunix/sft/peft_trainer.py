@@ -173,8 +173,12 @@ def _zero_safe_reciprocal(denom: jax.Array) -> jax.Array:
 
 def _opt_state_dtypes(optimizer: nnx.Optimizer) -> Any:
   """Returns the array dtype of every optimizer-state variable."""
+  def _get_dtype(value):
+    val = value.get_value()
+    return getattr(val, "dtype", None)
+
   return jax.tree_util.tree_map(
-      lambda value: value.get_value().dtype,
+      _get_dtype,
       nnx.state(optimizer, nnx.optimizer.OptState),
       is_leaf=lambda value: isinstance(value, nnx.Variable),
   )
@@ -186,8 +190,10 @@ def _restore_opt_state_float_dtypes(
   """Restores floating optimizer-state leaves to their pre-update dtypes."""
 
   def _restore(value, dtype):
+    if dtype is None:
+      return
     array = value.get_value()
-    if jnp.issubdtype(array.dtype, jnp.floating) and array.dtype != dtype:
+    if hasattr(array, "dtype") and jnp.issubdtype(array.dtype, jnp.floating) and array.dtype != dtype:
       value.set_value(array.astype(dtype))
 
   jax.tree_util.tree_map(
