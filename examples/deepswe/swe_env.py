@@ -151,7 +151,7 @@ def _init_global_fleet(
     effective_max_concurrent = max(
         max_concurrency, batch_size * num_generations * 2
     )
-
+    ready_timeout = int(os.getenv("SANDBOX_READY_TIMEOUT", "900"))
     template = template_mod.get_template(scaffold, node_sel)
 
     fleet_kwargs: dict[str, Any] = {
@@ -170,6 +170,7 @@ def _init_global_fleet(
             if max_warmpool_replicas is not None
             else num_generations
         ),
+        "ready_timeout": ready_timeout,
         "warm_per_task": True,
     }
     if template is not None:
@@ -508,24 +509,45 @@ class SWEEnv(BaseTaskEnv):
         image=task_img_str,
         metadata={"ds": self.entry},
     )
-    max_acquire_retries = 5
-    for attempt in range(max_acquire_retries):
+    max_acquire_attempts = int(os.getenv("SANDBOX_ACQUIRE_RETRIES", "3"))
+    for attempt in range(1, max_acquire_attempts + 1):
       try:
         self.handle = fleet.acquire(task)
         break
       except Exception as e:
-        if attempt < max_acquire_retries - 1:
+        err_str = str(e)
+        if "SandboxWarmPool" in type(e).__name__ or "SandboxWarmPool requested does not exist" in err_str:
           logging.warning(
-              "[SWEEnv] fleet.acquire failed (attempt %d/%d): %s; retrying in"
-              " %ds...",
-              attempt + 1,
-              max_acquire_retries,
-              e,
-              5 * (attempt + 1),
+              "[SWEEnv] Warm pool missing for task image %s; creating on-demand warm pool...",
+              task.image,
           )
-          time.sleep(5 * (attempt + 1))
-        else:
+          try:
+            # Evict from in-memory cache so warm_images doesn't think it already has replicas
+            if hasattr(fleet, "_warmed") and isinstance(fleet._warmed, dict):
+              fleet._warmed.pop(task.image, None)
+            fleet.warm_images([task.image], replicas_override=1, wait=True)
+          except Exception as warm_err:
+            logging.warning("[SWEEnv] Dynamic warm_images note: %s", warm_err)
+        if attempt == max_acquire_attempts:
+          logging.error(
+              "[SWEEnv] Failed to acquire SandboxHandle for task %s after"
+              " %d attempts: %s",
+              task.id,
+              max_acquire_attempts,
+              e,
+          )
           raise
+        wait_s = 5 * attempt
+        logging.warning(
+            "[SWEEnv] acquire attempt %d/%d failed with %s: %s; retrying in"
+            " %ds...",
+            attempt,
+            max_acquire_attempts,
+            type(e).__name__,
+            e,
+            wait_s,
+        )
+        time.sleep(wait_s)
     if self.scaffold == "openhands":
       from agent_sandbox_rl.adapters.openhands import make_handle_workspace  # pytype: disable=import-error
 
