@@ -193,6 +193,7 @@ spec:
                   --advantage_estimator grpo-loo \
                   --loss_agg_mode token-mean \
                   --float32_gate_logits True \
+                  --padded_base_moe_mlp_dim 1024 \
                   --trainable_parameters_mask '["^(?!.*routed_experts/gate/kernel).*"]' \
                   --checkpoint_storage_use_ocdbt True \
                   --checkpoint_storage_use_zarr3 False \

@@ -177,6 +177,12 @@ parser.add_argument(
     default=False,
     help="Whether to prefuse MoE weights in MaxText.",
 )
+parser.add_argument(
+    "--padded_base_moe_mlp_dim",
+    type=int,
+    default=None,
+    help="Optional override for padded MoE MLP dimension (e.g. 1024 for Qwen 35B under TP=4).",
+)
 
 # LoRA
 # LoRA Config
@@ -996,6 +1002,11 @@ trainer_config = pyconfig.initialize(
             if args.trainable_parameters_mask
             else []
         ),
+        *(
+            [f"padded_base_moe_mlp_dim={args.padded_base_moe_mlp_dim}"]
+            if args.padded_base_moe_mlp_dim
+            else []
+        ),
         "skip_jax_distributed_system=True",
         "load_checkpoint_only_once=True",
         "use_standalone_converter=False",
@@ -1023,6 +1034,11 @@ sampler_config = pyconfig.initialize(
         f"dtype={args.dtype}",
         "attention=vllm_rpa",
         f"float32_gate_logits={args.float32_gate_logits}",
+        *(
+            [f"padded_base_moe_mlp_dim={args.padded_base_moe_mlp_dim}"]
+            if args.padded_base_moe_mlp_dim
+            else []
+        ),
         "use_mrope=False",
         "override_model_config=True",
         "skip_jax_distributed_system=True",
