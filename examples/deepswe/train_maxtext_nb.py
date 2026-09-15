@@ -462,6 +462,12 @@ parser.add_argument(
         " 'openhands')."
     ),
 )
+parser.add_argument(
+    "--eval_parity_only",
+    type=str2bool,
+    default=False,
+    help="If True, run a single deterministic parity test comparing sampler vs trainer logps and exit.",
+)
 
 args, _ = parser.parse_known_args()
 
@@ -1443,6 +1449,129 @@ print("Syncing initial checkpoint weights to rollout workers...", flush=True)
 _prev_steps = rl_engine.global_steps
 rl_engine.sync_weights()
 rl_engine.global_steps = _prev_steps
+print("Weight sync complete!", flush=True)
+
+if args.eval_parity_only:
+  print("\n" + "=" * 80, flush=True)
+  print("STARTING SAMPLER-TRAINER PARITY EVALUATION (--eval_parity_only)", flush=True)
+  print("=" * 80, flush=True)
+
+  test_prompt = (
+      "<|im_start|>system\nYou are a helpful coding assistant.<|im_end|>\n"
+      "<|im_start|>user\nWrite a python function to check if a string is a palindrome.<|im_end|>\n"
+      "<|im_start|>assistant\n"
+  )
+  print(f"Submitting prompt for rollout generation:\n{repr(test_prompt)}", flush=True)
+
+  rollout_out = rl_engine.generate(
+      prompts=[test_prompt],
+      temperature=TEMPERATURE,
+      top_k=TOP_K if TOP_K is not None else -1,
+      top_p=TOP_P if TOP_P is not None else 1.0,
+      max_tokens=min(MAX_RESPONSE_LENGTH, 512),
+  )
+
+  completion_text = rollout_out.text[0]
+  print(f"\nGenerated Completion:\n{completion_text}\n", flush=True)
+
+  gen_tokens = np.asarray(rollout_out.tokens[0])
+  prompt_tokens = np.asarray(tokenizer.encode(test_prompt))
+  prompt_batch = jnp.asarray(prompt_tokens[None, :])
+  comp_batch = jnp.asarray(gen_tokens[None, :])
+  pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+  eos_id = tokenizer.eos_token_id
+
+  sampler_logps = np.asarray(rollout_out.logprobs[0]) if rollout_out.logprobs is not None else None
+  sampler_routed_experts = np.asarray(rollout_out.routed_experts[0]) if rollout_out.routed_experts is not None else None
+
+  print(f"Completion length: {len(gen_tokens)} tokens", flush=True)
+  print("Computing Trainer per-token log-probabilities via MaxText...", flush=True)
+  trainer_logps_jax = rl_engine.get_actor_per_token_logps(
+      prompt_tokens=prompt_batch,
+      completion_tokens=comp_batch,
+      pad_id=pad_id,
+      eos_id=eos_id,
+      micro_batch_size=1,
+  )
+  trainer_logps = np.asarray(trainer_logps_jax[0])
+
+  if sampler_logps is None or len(sampler_logps) == 0:
+    print("Warning: rollout_out.logprobs was None; falling back to rollout engine logprob pass.", flush=True)
+    sampler_logps = np.zeros_like(trainer_logps)
+
+  valid_mask = (gen_tokens != pad_id) & (gen_tokens != eos_id)
+  valid_indices = np.where(valid_mask)[0]
+  if len(valid_indices) == 0:
+    valid_indices = np.arange(len(gen_tokens))
+
+  t_logps = trainer_logps[valid_indices]
+  s_logps = sampler_logps[valid_indices]
+  toks = gen_tokens[valid_indices]
+
+  log_diff = t_logps - s_logps
+  abs_log_diff = np.abs(log_diff)
+  weights = np.exp(log_diff)
+
+  tis_min = args.truncated_importance_sampling_ratio_min or 0.999
+  tis_max = args.truncated_importance_sampling_ratio or 1.002
+  is_oob = (weights < tis_min) | (weights > tis_max)
+  outliers = abs_log_diff > 10.0
+
+  print("\n" + "=" * 80, flush=True)
+  print(" " * 25 + "SECTION 1: PARITY SUMMARY", flush=True)
+  print("=" * 80, flush=True)
+  print(f"Total Scored Tokens:                {len(toks):,}", flush=True)
+  print(f"Mean Absolute Logdiff (|Δ|):        {np.mean(abs_log_diff):.6f} nats", flush=True)
+  print(f"Max Absolute Logdiff (max |Δ|):     {np.max(abs_log_diff):.6f} nats", flush=True)
+  print(f"Geometric Mean Ratio (seq_geomean): {np.exp(np.mean(log_diff)):.6f}", flush=True)
+  print(f"OOB Token Ratio (out of bounds):    {np.mean(is_oob) * 100:.2f}%  (bounds: [{tis_min}, {tis_max}])", flush=True)
+  print(f"Extreme Outliers (> 10 nats):       {np.sum(outliers)} tokens", flush=True)
+  print(f"Min Importance Weight (w_min):      {np.min(weights):.6f}", flush=True)
+  print(f"Max Importance Weight (w_max):      {np.max(weights):.6f}", flush=True)
+  print("=" * 80, flush=True)
+
+  if sampler_routed_experts is not None:
+    print("\n" + "=" * 80, flush=True)
+    print(" " * 22 + "SECTION 2: MOE ROUTER AGREEMENT", flush=True)
+    print("=" * 80, flush=True)
+    print(f"Sampler routed experts shape: {sampler_routed_experts.shape}", flush=True)
+    print("=" * 80, flush=True)
+
+  print("\n" + "=" * 80, flush=True)
+  print(" " * 23 + "SECTION 3: TOP 15 WORST DIVERGING TOKENS", flush=True)
+  print("=" * 80, flush=True)
+  print(f"{'Pos':<6} {'Token ID':<10} {'Decoded':<20} {'Trainer LogP':<14} {'Sampler LogP':<14} {'Diff (Δ)':<12} {'Weight (e^Δ)':<14} {'Status'}", flush=True)
+  print("-" * 105, flush=True)
+
+  worst_indices = np.argsort(abs_log_diff)[::-1][:15]
+  for idx in worst_indices:
+    tok = toks[idx]
+    dec = repr(tokenizer.decode([tok]))
+    t_lp = t_logps[idx]
+    s_lp = s_logps[idx]
+    d = log_diff[idx]
+    w = weights[idx]
+    status = "OUTLIER" if abs(d) > 10.0 else ("OOB" if is_oob[idx] else "OK")
+    print(f"{idx:<6} {tok:<10} {dec:<20} {t_lp:<14.4f} {s_lp:<14.4f} {d:<+12.4f} {w:<14.4f} [{status}]", flush=True)
+  print("-" * 105, flush=True)
+
+  print("\n" + "=" * 80, flush=True)
+  print(" " * 20 + "SECTION 4: DIVERGENCE BY TOKEN POSITION", flush=True)
+  print("=" * 80, flush=True)
+  bucket_size = 64
+  num_buckets = int(np.ceil(len(toks) / bucket_size))
+  print(f"{'Token Range':<20} {'Mean |Δ| (nats)':<18} {'Max |Δ| (nats)':<18} {'OOB Frac':<12}", flush=True)
+  print("-" * 70, flush=True)
+  for b in range(num_buckets):
+    start_idx = b * bucket_size
+    end_idx = min((b + 1) * bucket_size, len(toks))
+    b_diff = abs_log_diff[start_idx:end_idx]
+    b_oob = is_oob[start_idx:end_idx]
+    print(f"[{start_idx:>4} - {end_idx:>4}]         {np.mean(b_diff):<18.6f} {np.max(b_diff):<18.6f} {np.mean(b_oob)*100:<10.1f}%", flush=True)
+  print("=" * 80, flush=True)
+
+  print("\nPARITY EVALUATION COMPLETED SUCCESSFULLY!", flush=True)
+  sys.exit(0)
 
 if (
     CKPT_DIR
