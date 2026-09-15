@@ -1465,10 +1465,7 @@ if args.eval_parity_only:
 
   rollout_out = rl_engine.generate(
       prompts=[test_prompt],
-      temperature=TEMPERATURE,
-      top_k=TOP_K if TOP_K is not None else -1,
-      top_p=TOP_P if TOP_P is not None else 1.0,
-      max_tokens=min(MAX_RESPONSE_LENGTH, 512),
+      max_generation_steps=min(MAX_RESPONSE_LENGTH, 512),
   )
 
   completion_text = rollout_out.text[0]
