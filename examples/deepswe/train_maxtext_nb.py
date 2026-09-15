@@ -1188,9 +1188,12 @@ adamw_opt = optax.adamw(
 
 from maxtext.optimizers import optimizers as maxtext_optimizers
 
-adamw_opt = maxtext_optimizers.apply_trainable_parameters_mask(
-    adamw_opt, trainer_config
-)
+if getattr(trainer_config, "trainable_parameters_mask", None) and hasattr(
+    maxtext_optimizers, "apply_trainable_parameters_mask"
+):
+  adamw_opt = maxtext_optimizers.apply_trainable_parameters_mask(
+      adamw_opt, trainer_config
+  )
 
 transforms = []
 if MAX_GRAD_NORM is not None:
