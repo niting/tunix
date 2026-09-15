@@ -73,7 +73,8 @@ def parse_args():
   parser.add_argument("--train_mesh_fsdp", type=int, default=64)
   parser.add_argument("--train_mesh_tp", type=int, default=2)
   parser.add_argument("--temperature", type=float, default=1.0)
-  parser.add_argument("--top_k", type=int, default=1)  # Greedy for exact deterministic verification
+  parser.add_argument("--top_k", type=int, default=-1)
+  parser.add_argument("--top_p", type=float, default=1.0)
   parser.add_argument("--max_response_length", type=int, default=1024)
   parser.add_argument("--tis_ratio_min", type=float, default=0.999)
   parser.add_argument("--tis_ratio_max", type=float, default=1.002)
@@ -255,8 +256,8 @@ def main():
       prompts=[test_prompt],
       temperature=args.temperature,
       top_k=args.top_k,
-      top_p=1.0,
-      max_tokens=256,
+      top_p=args.top_p,
+      max_tokens=args.max_response_length,
   )
 
   completion_text = rollout_out.text[0]
