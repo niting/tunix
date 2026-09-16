@@ -418,6 +418,49 @@ class MaxTextUtilsTest(absltest.TestCase):
       argv = self._build_config_argv()
     self.assertIn("checkpoint_storage_device_host_concurrent_gb=32", argv)
 
+  def test_ckpt_d2h_concurrent_gb_fallback_when_unsupported(self):
+    mock_pyconfig = mock.MagicMock()
+    mock_cfg = mock.MagicMock()
+
+    def side_effect(argv):
+      if any(
+          arg.startswith("checkpoint_storage_device_host_concurrent_gb=")
+          for arg in argv
+      ):
+        raise ValueError(
+            "Key checkpoint_storage_device_host_concurrent_gb not found"
+        )
+      return mock_cfg
+
+    mock_pyconfig.initialize.side_effect = side_effect
+    mock_pyconfig.__file__ = "/fake/maxtext/configs/pyconfig.py"
+
+    with mock.patch.dict(
+        "os.environ", {"CKPT_D2H_CONCURRENT_GB": "8"}
+    ), mock.patch.object(
+        maxtext_utils,
+        "maxtext_modules",
+        return_value=(mock_pyconfig, mock.MagicMock(), mock.MagicMock()),
+    ), mock.patch(
+        "os.path.exists", return_value=True
+    ), self.assertLogs(
+        level="WARNING"
+    ) as logs:
+      result = maxtext_utils.build_maxtext_config(model_name="gemma2-9b")
+      self.assertEqual(result, mock_cfg)
+      self.assertEqual(mock_pyconfig.initialize.call_count, 2)
+      second_argv = mock_pyconfig.initialize.call_args_list[1][0][0]
+      self.assertFalse(
+          any(
+              arg.startswith("checkpoint_storage_device_host_concurrent_gb=")
+              for arg in second_argv
+          )
+      )
+      self.assertIn(
+          "does not support checkpoint_storage_device_host_concurrent_gb",
+          "\n".join(logs.output),
+      )
+
   def test_checkpoint_save_interval_positive_enables_saving(self):
     argv = self._build_config_argv(
         checkpointing_options=mock.MagicMock(

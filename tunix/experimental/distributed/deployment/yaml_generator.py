@@ -74,7 +74,7 @@ def main() -> None:
   )
   parser.add_argument(
       "--pathways_proxy_memory_limit",
-      default="100G",
+      default="190G",
       help="Memory limit of the Pathways proxy container",
   )
   parser.add_argument(
@@ -99,8 +99,12 @@ def main() -> None:
   )
   parser.add_argument(
       "--user_container_memory_limit",
-      default="70G",
-      help="Memory limit for the user/worker container",
+      default="120G",
+      help=(
+          "Memory limit for the user/worker container. Generous burstable"
+          " ceiling prevents C++ std::bad_alloc during Raiden/Orbax D2H"
+          " staging of 32B+ models while keeping requests at 48G."
+      ),
   )
   parser.add_argument(
       "--pathways_worker_memory",

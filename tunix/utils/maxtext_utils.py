@@ -351,7 +351,24 @@ def build_maxtext_config(
     argv.append(f"checkpoint_storage_device_host_concurrent_gb={_d2h_gb}")
 
   logging.info("MaxText config argv: %s", argv)
-  return pyconfig.initialize(argv)
+  try:
+    return pyconfig.initialize(argv)
+  except Exception as e:
+    if _d2h_gb and "checkpoint_storage_device_host_concurrent_gb" in str(e):
+      logging.warning(
+          "MaxText does not support checkpoint_storage_device_host_concurrent_gb "
+          "(requires AI-Hypercomputer/maxtext#5234 or newer); ignoring "
+          "CKPT_D2H_CONCURRENT_GB=%s (%s).",
+          _d2h_gb,
+          e,
+      )
+      argv = [
+          arg
+          for arg in argv
+          if not arg.startswith("checkpoint_storage_device_host_concurrent_gb=")
+      ]
+      return pyconfig.initialize(argv)
+    raise
 
 
 def create_maxtext_mesh(maxtext_config: Any) -> Any:
